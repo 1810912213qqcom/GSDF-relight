@@ -68,3 +68,6 @@ Simply run the training script as you would for gs-relight. The SDF training hap
 ```bash
 python train.py -s <path_to_dataset> --model_path <path_to_output>
 ```
+
+
+
