@@ -21,6 +21,7 @@ from diff_gaussian_rasterization_light import  GaussianRasterizer as GaussianRas
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.graphics_utils import getProjectionMatrix, look_at
+from utils.general_utils import build_rotation
 
 def render(viewpoint_camera, 
            pc : GaussianModel, 
@@ -35,7 +36,9 @@ def render(viewpoint_camera,
            override_color = None, 
            fix_labert = False, 
            inten_scale = 1.0,
-           is_train = False):
+           is_train = False,
+           out_depth = False,
+           return_normal = False):
     """
     Render the scene. 
     
@@ -217,13 +220,69 @@ def render(viewpoint_camera,
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
 
-    return {"render": rendered_image[0:3, :, :],
+    return_dict = {"render": rendered_image[0:3, :, :],
             "shadow": rendered_image[3:4, :, :],
             "other_effects": rendered_image[4:7, :, :],
             "viewspace_points": meta["means2d"],
             "visibility_filter" : radii > 0,
             "radii": radii,
             "out_weight": out_weight}
+
+    if out_depth:
+        depth = (means3D - viewpoint_camera.camera_center).norm(dim=1, keepdim=True).repeat(1, 3)
+        rendered_depth, _, _ = rasterization(
+            means = means3D,
+            quats = rotations,
+            scales = scales,
+            opacities = opacity.squeeze(-1),
+            colors = depth,
+            viewmats = viewpoint_camera.world_view_transform.transpose(0, 1)[None, ...],
+            Ks = K[None, ...],
+            width = int(viewpoint_camera.image_width),
+            height = int(viewpoint_camera.image_height),
+            near_plane = viewpoint_camera.znear,
+            far_plane = viewpoint_camera.zfar,
+            eps2d = 0.3,
+            sh_degree = None,
+            packed = False,
+            backgrounds = torch.zeros_like(bg_color[None, ...][:, :3]) # Depth background 0
+        )
+        return_dict['depth_hand'] = rendered_depth[0].permute(2, 0, 1)[0:1, :, :]
+
+    if return_normal:
+        rotations_mat = build_rotation(rotations)
+        min_scales = torch.argmin(scales, dim=1)
+        indices = torch.arange(min_scales.shape[0])
+        normal = rotations_mat[indices, :, min_scales]
+
+        view_dir = means3D - viewpoint_camera.camera_center
+        normal = (
+            normal * ((((view_dir * normal).sum(dim=-1) < 0) * 1 - 0.5) * 2)[..., None]
+        )
+        
+        rendered_normal, _, _ = rasterization(
+            means = means3D,
+            quats = rotations,
+            scales = scales,
+            opacities = opacity.squeeze(-1),
+            colors = normal,
+            viewmats = viewpoint_camera.world_view_transform.transpose(0, 1)[None, ...],
+            Ks = K[None, ...],
+            width = int(viewpoint_camera.image_width),
+            height = int(viewpoint_camera.image_height),
+            near_plane = viewpoint_camera.znear,
+            far_plane = viewpoint_camera.zfar,
+            eps2d = 0.3,
+            sh_degree = None,
+            packed = False,
+            backgrounds = torch.zeros_like(bg_color[None, ...][:, :3]) # Normal background 0
+        )
+        
+        render_normal = rendered_normal[0].permute(2, 0, 1)
+        render_normal = torch.nn.functional.normalize(render_normal, dim=0)
+        return_dict['gs_normal'] = render_normal
+
+    return return_dict
 
 def _dot(x, y):
     return torch.sum(x * y, -1, keepdim=True)
