@@ -16,18 +16,12 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render
 import sys
-from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
-import uuid
-from tqdm import tqdm
-from utils.image_utils import psnr
-from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams
+
 try:
-    from torch.utils.tensorboard import SummaryWriter
-    TENSORBOARD_FOUND = True
+    import lpips
+    loss_fn_alex = lpips.LPIPS(net='alex').cuda()
 except ImportError:
-    TENSORBOARD_FOUND = False
+    loss_fn_alex = None
 
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -53,6 +47,7 @@ def get_sdf_config(radius=1.0):
         'feature_dim': 64,
         'grad_type': 'analytic',
         'finite_difference_eps': 1e-3,
+        'custom_smoothing': False,
         'isosurface': {
             'method': 'mc',
             'resolution': 128,
@@ -227,6 +222,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         
+        # Metrics for logging
+        with torch.no_grad():
+            psnr_val = psnr(image, gt_image).mean().double()
+            ssim_val = ssim(image, gt_image).mean().double()
+            if loss_fn_alex is not None:
+                lpips_val = loss_fn_alex(image, gt_image).mean().double()
+            else:
+                lpips_val = 0.0
+        
         # SDF Integration
         # 1. Get Gaussian Depth and Normal
         gs_depth = render_pkg['depth_hand']
@@ -324,11 +328,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "PSNR": f"{psnr_val:.{2}f}", "SSIM": f"{ssim_val:.{3}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            # Log and save
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), \
                 testing_iterations, scene, render, (pipe, background), gamma=2.2 if dataset.hdr else 1.0)
@@ -430,27 +435,102 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         local_axises = scene.gaussians.get_local_axis # (K, 3, 3)
         asg_scales = scene.gaussians.asg_func.get_asg_lam_miu # (basis_asg_num, sg_num, 2)
         asg_axises = scene.gaussians.asg_func.get_asg_axis    # (basis_asg_num, sg_num, 3, 3)
+        
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                ssim_test = 0.0
+                lpips_test = 0.0
+                
+                metrics_dict = {}
+                
+                print(f"\n[ITER {iteration}] Evaluating {config['name']} set...")
+                
                 for idx, viewpoint in enumerate(config['cameras']):
-                    render_pkg = renderFunc(viewpoint, scene.gaussians, light_stream, calc_stream, local_axises, asg_scales, asg_axises, *renderArgs)
+                    # Ensure we request normals and depth for validation rendering
+                    render_pkg = renderFunc(viewpoint, scene.gaussians, light_stream, calc_stream, local_axises, asg_scales, asg_axises, *renderArgs, out_depth=True, return_normal=True)
                     mimage, shadow, other_effects = render_pkg["render"], render_pkg["shadow"], render_pkg["other_effects"]
                     image = torch.clamp(mimage * shadow + other_effects, 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    
+                    # Calculate Metrics
+                    _l1 = l1_loss(image, gt_image).mean().double()
+                    _psnr = psnr(image, gt_image).mean().double()
+                    _ssim = ssim(image, gt_image).mean().double()
+                    if loss_fn_alex is not None:
+                        _lpips = loss_fn_alex(image, gt_image).mean().double()
+                    else:
+                        _lpips = 0.0
+                    
+                    l1_test += _l1
+                    psnr_test += _psnr
+                    ssim_test += _ssim
+                    lpips_test += _lpips
+                    
+                    metrics_dict[viewpoint.image_name] = {
+                        "PSNR": _psnr.item(),
+                        "SSIM": _ssim.item(),
+                        "LPIPS": _lpips.item() if isinstance(_lpips, torch.Tensor) else _lpips
+                    }
+
+                    # Save Images (Render, GT, Depth, Normal, Shadow)
+                    if config['name'] == 'test' or (config['name'] == 'train' and idx < 5):
+                        dump_dir = os.path.join(scene.model_path, config['name'] + f"_view_{viewpoint.image_name}")
+                        os.makedirs(dump_dir, exist_ok=True)
+                        
+                        # RGB
+                        torchvision.utils.save_image(image, os.path.join(dump_dir, "render.png"))
+                        torchvision.utils.save_image(gt_image, os.path.join(dump_dir, "gt.png"))
+                        
+                        # Shadow
+                        torchvision.utils.save_image(shadow, os.path.join(dump_dir, "shadow.png"))
+                        
+                        # Normal
+                        if 'gs_normal' in render_pkg:
+                            normal_vis = (render_pkg['gs_normal'] + 1.0) / 2.0
+                            torchvision.utils.save_image(normal_vis, os.path.join(dump_dir, "normal.png"))
+                        
+                        # Depth
+                        if 'depth_hand' in render_pkg:
+                            depth_vis = render_pkg['depth_hand']
+                            depth_vis = depth_vis / (depth_vis.max() + 1e-5)
+                            torchvision.utils.save_image(depth_vis, os.path.join(dump_dir, "depth.png"))
+
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None].pow(1./gamma), global_step=iteration)
+                        
+                        # Log Normal Map
+                        if 'gs_normal' in render_pkg:
+                            normal_vis = (render_pkg['gs_normal'] + 1.0) / 2.0
+                            tb_writer.add_images(config['name'] + "_view_{}/normal".format(viewpoint.image_name), normal_vis[None], global_step=iteration)
+                        
+                        # Log Depth Map
+                        if 'depth_hand' in render_pkg:
+                            depth_vis = render_pkg['depth_hand']
+                            depth_vis = depth_vis / (depth_vis.max() + 1e-5) # Normalize for visualization
+                            tb_writer.add_images(config['name'] + "_view_{}/depth".format(viewpoint.image_name), depth_vis[None], global_step=iteration)
+
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None].pow(1./gamma), global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                l1_test /= len(config['cameras'])
+                ssim_test /= len(config['cameras'])
+                lpips_test /= len(config['cameras'])
+                
+                print(f"\n[ITER {iteration}] {config['name']} Results: L1 {l1_test:.4f} PSNR {psnr_test:.4f} SSIM {ssim_test:.4f} LPIPS {lpips_test:.4f}")
+                
+                # Save metrics to JSON
+                with open(os.path.join(scene.model_path, f"{config['name']}_metrics_{iteration}.json"), 'w') as f:
+                    json.dump(metrics_dict, f, indent=4)
+                    f.write(f"\nAverage: PSNR {psnr_test}, SSIM {ssim_test}, LPIPS {lpips_test}")
+
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
