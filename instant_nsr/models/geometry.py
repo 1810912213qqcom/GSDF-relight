@@ -11,7 +11,12 @@ from instant_nsr.models.utils import scale_anything, get_activation, cleanup, ch
 from instant_nsr.models.network_utils import get_encoding, get_mlp, get_encoding_with_network
 from instant_nsr.utils.misc import get_rank
 from instant_nsr.systems.utils import update_module_step
-from nerfacc import ContractionType
+try:
+    from nerfacc import ContractionType
+except ImportError:
+    class ContractionType:
+        AABB = 0
+        UN_BOUNDED_SPHERE = 1
 
 import numpy as np
 import math

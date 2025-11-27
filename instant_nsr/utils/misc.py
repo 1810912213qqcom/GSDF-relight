@@ -32,7 +32,20 @@ def load_config(*yaml_files, cli_args=[]):
 
 
 def config_to_primitive(config, resolve=True):
-    return OmegaConf.to_container(config, resolve=resolve)
+    if isinstance(config, (dict, list, int, float, str, bool, type(None))):
+        return config
+    if hasattr(config, '__dict__'):
+        def to_dict(obj):
+            if isinstance(obj, (list, tuple)):
+                return [to_dict(x) for x in obj]
+            if hasattr(obj, '__dict__'):
+                return {k: to_dict(v) for k, v in obj.__dict__.items()}
+            return obj
+        return to_dict(config)
+    try:
+        return OmegaConf.to_container(config, resolve=resolve)
+    except ValueError:
+        return config
 
 
 def dump_config(path, config):
