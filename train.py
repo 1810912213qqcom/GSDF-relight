@@ -16,11 +16,32 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render
 import sys
+from scene import Scene, GaussianModel
+from utils.general_utils import safe_state
+import uuid
+from tqdm import tqdm
+from utils.image_utils import psnr
+from argparse import ArgumentParser, Namespace
+from arguments import ModelParams, PipelineParams, OptimizationParams
+import torchvision
+import json
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_FOUND = True
+except ImportError:
+    TENSORBOARD_FOUND = False
+
+loss_fn_alex = None
 try:
     import lpips
     loss_fn_alex = lpips.LPIPS(net='alex').cuda()
+    print("LPIPS loaded successfully.")
 except ImportError:
+    loss_fn_alex = None
+    print("LPIPS not found.")
+except Exception as e:
+    print(f"Error loading LPIPS: {e}")
     loss_fn_alex = None
 
 import sys
@@ -418,7 +439,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, gamma=1.0):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene, renderFunc, renderArgs, gamma=1.0):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -475,8 +496,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     }
 
                     # Save Images (Render, GT, Depth, Normal, Shadow)
+                    # Save Images (Render, GT, Depth, Normal, Shadow)
                     if config['name'] == 'test' or (config['name'] == 'train' and idx < 5):
-                        dump_dir = os.path.join(scene.model_path, config['name'] + f"_view_{viewpoint.image_name}")
+                        dump_dir = os.path.join(scene.model_path, config['name'] + f"_iter_{iteration}_view_{viewpoint.image_name}")
                         os.makedirs(dump_dir, exist_ok=True)
                         
                         # RGB
