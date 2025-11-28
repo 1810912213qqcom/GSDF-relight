@@ -17,7 +17,7 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, build_rotation
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -319,13 +319,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             sdf_grad = sdf_model.get_sdf_and_gradient(sampled_xyz)
             loss_eikonal = ((torch.linalg.norm(sdf_grad, ord=2, dim=-1) - 1.)**2).mean()
             
-            # Normal Consistency
-            # SDF normal should match Gaussian normal?
-            # Gaussian normal is hard to define for a single point (it's an ellipsoid).
-            # But we have `gs_normal` map.
-            # Let's stick to Eikonal and Zero-level set for now.
+            # Normal Consistency Loss
+            # 1. Get Gaussian rotations and scales
+            rotations = gaussians.get_rotation[visible_mask][indices]
+            scales = gaussians.get_scaling[visible_mask][indices]
             
-            loss_sdf = loss_sdf_zero * 1.0 + loss_eikonal * 0.1
+            # 2. Build rotation matrices
+            R = build_rotation(rotations) # [N, 3, 3]
+            
+            # 3. Find index of smallest scale (assuming it represents the normal direction)
+            min_scale_idx = torch.argmin(scales, dim=1) # [N]
+            
+            # 4. Extract normal vectors from R
+            # R columns correspond to axes. We want the column corresponding to min_scale_idx
+            # We can gather this.
+            # R is [N, 3, 3]. We want [N, 3]
+            normal_gs = torch.stack([R[i, :, min_scale_idx[i]] for i in range(R.shape[0])])
+            
+            # 5. Compute Cosine Similarity (absolute value because orientation is ambiguous)
+            # sdf_grad is the normal of the SDF
+            sdf_normal = torch.nn.functional.normalize(sdf_grad, dim=-1)
+            dot_prod = torch.abs((normal_gs * sdf_normal).sum(dim=-1))
+            loss_normal = (1.0 - dot_prod).mean()
+            
+            loss_sdf = loss_sdf_zero * 1.0 + loss_eikonal * 0.1 + loss_normal * 0.5
             
             # Add to total loss
             loss += loss_sdf
@@ -384,6 +401,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     
                     if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                         gaussians.reset_opacity()
+                        
+                    # SDF-based Pruning (Bidirectional Supervision: SDF -> GS)
+                    # Prune Gaussians that are far from the SDF zero-level set
+                    if iteration > opt.densify_from_iter and iteration % 500 == 0:
+                        with torch.no_grad():
+                            xyz = gaussians.get_xyz
+                            sdf_values = sdf_model.forward_level(xyz)
+                            # Threshold for pruning (e.g., 0.1 or adaptive)
+                            prune_mask = torch.abs(sdf_values) > 0.1
+                            if prune_mask.sum() > 0:
+                                print(f"[ITER {iteration}] SDF Pruning: Removing {prune_mask.sum()} Gaussians far from surface.")
+                                gaussians.prune_points(prune_mask)
+
                 else:
                     prune_visibility = False
 
