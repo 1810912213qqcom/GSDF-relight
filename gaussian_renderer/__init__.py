@@ -226,6 +226,7 @@ def render(viewpoint_camera,
             "viewspace_points": meta["means2d"],
             "visibility_filter" : radii > 0,
             "radii": radii,
+            "alpha": alphas[0].permute(2, 0, 1),
             "out_weight": out_weight}
 
     if out_depth:
