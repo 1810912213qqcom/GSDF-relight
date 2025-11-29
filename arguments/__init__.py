@@ -111,7 +111,12 @@ class OptimizationParams(ParamGroup):
         self.asg_lr_init = 0.01
         self.asg_lr_final = 0.0001
         self.asg_lr_delay_mult = 0.01
+        self.asg_lr_delay_mult = 0.01
         self.asg_lr_max_steps = 50_000
+        
+        # translucency lr
+        self.translucency_lr_init = 0.01
+        self.translucency_lr_final = 0.001
         
         # local frame lr
         self.local_q_lr_freeze_step = 40_000

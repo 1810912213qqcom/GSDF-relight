@@ -67,6 +67,7 @@ class GaussianModel:
         self.use_MBRDF = use_MBRDF
         self.kd = torch.empty(0)
         self.ks = torch.empty(0)
+        self.translucency = torch.empty(0)
         
         # ASG params
         self.basis_asg_num = basis_asg_num
@@ -117,6 +118,7 @@ class GaussianModel:
             self.asg_func.asg_scales,
             self.local_q,
             self.neural_material,
+            self.translucency,
             self.neural_material_size,
             self.neural_phasefunc.state_dict() if self.use_MBRDF else self.neural_phasefunc,
             self._scaling,
@@ -145,6 +147,7 @@ class GaussianModel:
         self.asg_func.asg_scales,
         self.local_q,
         self.neural_material,
+        self.translucency,
         self.neural_material_size,
         neural_phasefunc_param,
         self._scaling,
@@ -192,6 +195,10 @@ class GaussianModel:
     @property
     def get_ks(self):
         return self.kd_activation(self.ks)
+
+    @property
+    def get_translucency(self):
+        return torch.sigmoid(self.translucency)
 
     @property
     def get_alpha_asg(self):
@@ -256,6 +263,10 @@ class GaussianModel:
             
             neural_materials = torch.ones((features.shape[0], self.neural_material_size), dtype=torch.float, device="cuda")
             self.neural_material = nn.Parameter(neural_materials.requires_grad_(True))
+            
+            translucency = torch.zeros((features.shape[0], 1), dtype=torch.float, device="cuda")
+            self.translucency = nn.Parameter(translucency.requires_grad_(True))
+
             self.neural_phasefunc = Neural_phase(hidden_feature_size=self.hidden_feature_size, \
                                                 hidden_feature_layers=self.hidden_feature_layer, \
                                                 frequency=self.phase_frequency, \
@@ -289,6 +300,7 @@ class GaussianModel:
             l.append({'params': [self.asg_func.asg_rotation], 'lr': training_args.asg_lr_init, "name": "asg_rotation"})
             l.append({'params': [self.local_q], 'lr': training_args.local_q_lr_init, "name": "local_q"})
             l.append({'params': [self.neural_material], 'lr': training_args.neural_phasefunc_lr_init, "name": "neural_material"})
+            l.append({'params': [self.translucency], 'lr': training_args.translucency_lr_init, "name": "translucency"})
             l.append({'params': self.neural_phasefunc.parameters(), 'lr': training_args.neural_phasefunc_lr_init, "name": "neural_phasefunc"})
 
 

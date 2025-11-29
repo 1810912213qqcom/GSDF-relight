@@ -155,11 +155,15 @@ def render(viewpoint_camera,
                 specular = pc.get_ks * pc.asg_func(wi_local, wo_local, pc.get_alpha_asg, asg_scales, asg_axises) # (K, 3)
             
                 if fix_labert:
-                    colors_precomp = diffuse
+                    colors_precomp = diffuse * cosTheta
                 else:
-                    colors_precomp = diffuse + specular 
+                    # SSS
+                    backlight = torch.clamp(_dot(wi, -wo) + 0.2, min=0.0)
+                    sss = pc.get_translucency * pc.get_kd * backlight
+                    
+                    colors_precomp = (diffuse + specular) * cosTheta + sss
                 # intensity decays with distance
-                colors_precomp = colors_precomp * cosTheta * dist_2_inv
+                colors_precomp = colors_precomp * dist_2_inv
 
             # calc_stream.wait_stream(light_stream)
             torch.cuda.current_stream().wait_stream(light_stream)
